@@ -1824,3 +1824,120 @@ function projection_vector(ansatze::Vector{<:Ansatz}, clusters, norb)
 
     return proj_vec #=}}}=#
 end
+"""
+    cmf_oo_newton( ints_in::InCoreInts{T}, clusters::Vector{MOCluster}, fspace,dguess::RDM1{T}; 
+                    maxiter_oo      = 100, 
+                    maxiter_ci      = 100, 
+                    maxiter_d1      = 100, 
+                    tol_oo          = 1e-6, 
+                    tol_d1          = 1e-7, 
+                    tol_ci          = 1e-8, 
+                    verbose         = 0, 
+                    use_pyscf=true,
+                    sequential      = false
+    )where T
+    
+    Do CMF with orbital optimization using Newton's algorithm
+
+# Arguments
+
+- `ints::InCoreInts`: integrals for full system
+- `clusters::Vector{MOCluster}`: vector of cluster objects
+- `fspace::Vector{Vector{Integer}}`: vector of particle number occupations for each cluster specifying the sectors of fock space 
+- `dguess`: initial guess for 1particle density matrix
+- `maxiter_oo`: Max iter for the orbital optimization iterations 
+- `maxiter_d1`: Max iter for the cmf iteration for the 1RDM 
+- `maxiter_ci`: Max iter for the CI diagonalization of the cluster states 
+- `tol_oo`: Convergence threshold for change in orbital gradient 
+- `tol_ci`: Convergence threshold for the cluster CI problems 
+- `tol_d1`: Convergence threshold for the CMF 1RDM 
+- `use_pyscf`: Use pyscf for FCI calculation
+- `sequential`: If true use the density matrix of the previous cluster in a cMF iteration to form effective integrals. Improves convergence, may depend on cluster orderings   
+- `verbose`: Printing level 
+- `step_trust_region` to control the size of trust region with the step-size
+# Returns
+
+- `e`: Energy
+- `U::Matrix`: Orbital rotation matrix from input to output orbitals
+- `d1::RDM1`: Optimized 1RDM in the optimized orbital basis
+"""
+
+function cmf_oo_newton( ints_in::InCoreInts{T}, clusters::Vector{MOCluster}, fspace, dguess::RDM1{T}; 
+                    maxiter_oo      = 100, 
+                    maxiter_ci      = 100, 
+                    maxiter_d1      = 100, 
+                    tol_oo          = 1e-6, 
+                    tol_d1          = 1e-7, 
+                    tol_ci          = 1e-8, 
+                    verbose         = 0, 
+                    step_trust_region=0.95,
+                    use_pyscf=true,
+                    sequential      = false,
+                    trust_region=false,
+                    
+    ) where T
+    #={{{=#
+    println(" Solve OO-CMF with newton")
+    ints = deepcopy(ints_in)
+    norb = n_orb(ints)
+    d1   = deepcopy(dguess) 
+    U    = Matrix(1.0I, norb, norb)
+    e    = 0.0
+    function step!(ints, d1, k)
+        norb = n_orb(ints)
+        K = unpack_gradient(k, norb)
+        #K=reshape(k,(norb,norb)
+       
+        Ui = exp(K)
+        
+        tmp = orbital_rotation(ints,Ui)
+        ints.h1 .= tmp.h1
+        ints.h2 .= tmp.h2
+
+        tmp = orbital_rotation(d1,Ui)
+        d1.a .= tmp.a
+        d1.b .= tmp.b
+
+        e, rdm1_dict, rdm2_dict = cmf_ci(ints, clusters, fspace,d1, 
+                                         maxiter_d1 = maxiter_d1, 
+                                         maxiter_ci = maxiter_ci, 
+                                         tol_d1     = tol_d1, 
+                                         tol_ci     = tol_ci, 
+                                         verbose    = verbose, 
+                                         use_pyscf=use_pyscf,
+                                         sequential = sequential)
+        
+        gd1, gd2 = assemble_full_rdm(clusters, rdm1_dict, rdm2_dict)
+        g_i = build_orbital_gradient(ints, gd1, gd2)
+        # energy_computed=compute_energy(ints, gd1,gd2)
+        packed_hessian=RDM.build_orbital_hessian(ints,gd1,gd2)
+        return e, g_i, Ui, gd1,packed_hessian
+    end
+
+
+    converged = false
+    step_i = zeros(norb*(norb-1)÷2) 
+    #step_i=zeros(norb*norb)
+    for i in 1:maxiter_oo
+        ei, g, Ui, d1,h_i= step!(ints, d1, step_i)
+        g_i=g
+        step_i=-(pinv(h_i)*(g_i))#;atol=1e-8  
+        if trust_region==true
+            if norm(step_i)> step_trust_region
+                step_i=step_i*step_trust_region/norm(step_i)
+            end
+        end
+        e = ei
+        U = U*Ui    
+        converged = norm(g_i) < tol_oo 
+        if converged
+            @printf(" Step: %4i E: %16.12f G: %12.2e   \n", i, ei, norm(g_i))
+            # display(packed_hessian)
+            break
+        else
+            @printf(" Step: %4i E: %16.12f G: %12.2e step_size: %12.2e \n", i, ei, norm(g_i), norm(step_i))
+        end
+    end
+    return  e,U,d1  
+#=}}}=#
+end
